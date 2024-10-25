@@ -29,6 +29,6 @@
     },
     "metric": {
         "_type": "choice", 
-        "_value": ["euclidean", "l1", "l2", "cosine","haversine"]
+        "_value": ["euclidean", "l1", "l2", "cosine"]
     }
 }
