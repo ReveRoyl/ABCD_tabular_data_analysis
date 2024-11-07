@@ -1,10 +1,10 @@
 # 加载 psych 包
-install.packages("psych")
+# install.packages("psych")
 library(psych)
 
 # 设置数据路径并加载数据
 data_path <- "G:/ABCD/script/trail/trail_tsne_RF"
-data <- read.csv(file.path(data_path, "merged.csv"))
+data <- read.csv(file.path(data_path, "merged_twins.csv"))
 
 # data_path <- "G:/ABCD/script/trail/trail_tsne_RF/test"
 # data <- read.csv(file.path(data_path, "all_year_labels.csv"))
@@ -26,5 +26,5 @@ polychoric_corr <- polychoric(data_cleaned)$rho  # 使用 $rho 获取相关系�
 
 
 # 保存 Polychoric 相关矩阵到 CSV 文件
-write.csv(polychoric_corr, file = file.path(data_path, "factor analysis/polychoric_correlation_matrix.csv"), row.names = TRUE)
+write.csv(polychoric_corr, file = file.path(data_path, "factor analysis/output/polychoric_correlation_matrix_twins.csv"), row.names = TRUE)
 
