@@ -1,0 +1,20 @@
+{
+    "layer1_neurons": {
+        "_type": "randint",
+        "_value": [0, 128]
+    },
+    "layer2_neurons": {
+        "_type": "randint",
+        "_value": [0, 128],
+		"_condition": {
+			"layer1_neurons": ">= $value"
+		}
+    },
+    "layer3_neurons": {
+        "_type": "randint",
+        "_value": [0, 128],
+		"_condition": {
+			"layer2_neurons": ">= $value"
+		}
+	}
+}

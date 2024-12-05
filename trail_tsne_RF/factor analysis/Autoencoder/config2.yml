@@ -1,0 +1,12 @@
+experimentName: autoencoder_optimization
+trialConcurrency: 1
+maxTrialNumber: 100
+searchSpaceFile: search_space.json
+tuner:
+  name: TPE
+  classArgs:
+    optimize_mode: maximize
+trialCommand: python 2_au.py
+trialCodeDirectory: .
+trainingService:
+  platform: local
