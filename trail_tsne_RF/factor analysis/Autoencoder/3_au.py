@@ -54,7 +54,7 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32)
 # Define PyTorch dataset
 class Autoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim, layer1_neurons=128, layer2_neurons=64, layer3_neurons=32):
+    def __init__(self, input_dim, latent_dim, layer1_neurons=layer1_neurons, layer2_neurons=layer2_neurons, layer3_neurons=layer3_neurons):
         super(Autoencoder, self).__init__()
         
         # Encoder

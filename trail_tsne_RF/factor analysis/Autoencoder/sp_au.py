@@ -166,11 +166,11 @@ for epoch in range(2000):
 # Extract latent features
 model.eval()
 with torch.no_grad():
-    encoded, reconstructed = model(torch.tensor(X, dtype=torch.float32))
+    encoded, reconstructed = model(torch.tensor(X_scaled, dtype=torch.float32))
     X_latent = model.encoder(torch.tensor(X_scaled, dtype=torch.float32)).numpy()
-    reconstruction_errors = torch.mean((torch.tensor(X, dtype=torch.float32) - reconstructed) ** 2, dim=1).numpy()
+    reconstruction_errors = torch.mean((torch.tensor(X_scaled, dtype=torch.float32) - reconstructed) ** 2, dim=1).numpy()
 
-total_variance = np.var(X, axis=0).sum()
+total_variance = np.var(X_scaled, axis=0).sum()
 latent_df = pd.DataFrame(X_latent, columns=[f'Factor_{i+1}' for i in range(latent_dim)])
 # 计算每个因子贡献的方差
 # 通过重建数据的方差贡献，计算解释率
