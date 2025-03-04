@@ -1,6 +1,6 @@
 *.csv
 *.tpf
-*.html
 *.inp
 *.out
 *.dat
+*.pdf
