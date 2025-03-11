@@ -1,32 +1,87 @@
+import os
+from pathlib import Path
 import matplotlib
 import matplotlib.pyplot as plt
 import netron
+import nni
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import torch
 import torch.onnx
 from sklearn.linear_model import Lasso
 from sklearn.metrics import r2_score
-from sklearn.model_selection import cross_val_predict
+from sklearn.model_selection import cross_val_predict, train_test_split
+from sklearn.preprocessing import MinMaxScaler
 from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+
 # --------------------------------------------------------------------------------------------------
+class QuestionnaireDataset(Dataset):
+    def __init__(self, data):
+        self.data = torch.tensor(data, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.data[idx]  # Input and target are the same
+
+
+# Step 2: Define the autoencoder architecture
+class AutoencoderModel(nn.Module):
+    def __init__(
+        self, input_dim, latent_dim, layer1_neurons, layer2_neurons, layer3_neurons
+    ):
+        super(AutoencoderModel, self).__init__()
+
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, layer1_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer1_neurons, layer2_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer2_neurons, layer3_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer3_neurons, latent_dim),
+        )
+
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, layer3_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer3_neurons, layer2_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer2_neurons, layer1_neurons),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(layer1_neurons, input_dim),
+        )
+
+    def forward(self, x):
+        # forward
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+
+def is_nni_running():
+    """If NNI is running, return True; otherwise, return False."""
+    return "NNI_PLATFORM" in os.environ
+
 
 class Autoencoder:
-    def __init__(self, X_train, X_val, encoding_dim, layer1_neurons=19, layer2_neurons=79, layer3_neurons=75):
-        # Create PyTorch datasets and dataloaders
-        class QuestionnaireDataset(Dataset):
-            def __init__(self, data):
-                self.data = torch.tensor(data, dtype=torch.float32)
-
-            def __len__(self):
-                return len(self.data)
-
-            def __getitem__(self, idx):
-                return self.data[idx], self.data[idx]  # Input and target are the same
+    def __init__(
+        self,
+        X_train,
+        X_val,
+        encoding_dim,
+        layer1_neurons=19,
+        layer2_neurons=79,
+        layer3_neurons=75,
+    ):
 
         train_dataset = QuestionnaireDataset(X_train)
         val_dataset = QuestionnaireDataset(X_val)
@@ -34,46 +89,17 @@ class Autoencoder:
         self.train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
         self.val_loader = DataLoader(val_dataset, batch_size=32)
 
-        # Step 2: Define the autoencoder architecture
-        class AutoencoderModel(nn.Module):
-            def __init__(self, input_dim, latent_dim, layer1_neurons, layer2_neurons, layer3_neurons):
-                super(AutoencoderModel, self).__init__()
-
-                # Encoder
-                self.encoder = nn.Sequential(
-                    nn.Linear(input_dim, layer1_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer1_neurons, layer2_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer2_neurons, layer3_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer3_neurons, latent_dim),
-                )
-
-                # Decoder
-                self.decoder = nn.Sequential(
-                    nn.Linear(latent_dim, layer3_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer3_neurons, layer2_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer2_neurons, layer1_neurons),
-                    nn.LeakyReLU(negative_slope=0.01),
-                    nn.Linear(layer1_neurons, input_dim),
-                )
-
-            def forward(self, x):
-                # forward
-                encoded = self.encoder(x)
-                decoded = self.decoder(encoded)
-                return decoded
-
         # Model initialization
         input_dim = X_train.shape[1]
         latent_dim = encoding_dim
-        self.model = AutoencoderModel(input_dim, latent_dim, layer1_neurons, layer2_neurons, layer3_neurons)
+        self.model = AutoencoderModel(
+            input_dim, latent_dim, layer1_neurons, layer2_neurons, layer3_neurons
+        )
         self.criterion = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode="min", factor=0.1, patience=5)
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.1, patience=5
+        )
 
     def train(self):
         best_val_loss = float("inf")
@@ -123,22 +149,24 @@ class Autoencoder:
         plt.title("Loss Curves")
         plt.show()
 
-    def evaluate_on_data(self, X_scaled):
+    def evaluate_on_data(self, X):
         self.model.eval()
         with torch.no_grad():
             # Forward pass to get reconstructed data
-            reconstructed = self.model(torch.tensor(X_scaled, dtype=torch.float32))
+            if not isinstance(X, np.ndarray):
+                X = np.array(X)
+            reconstructed = self.model(torch.tensor(X, dtype=torch.float32))
 
             # Get the output of the encoder, i.e., latent factors
             latent_factors = self.model.encoder(
-                torch.tensor(X_scaled, dtype=torch.float32)
+                torch.tensor(X, dtype=torch.float32)
             ).numpy()
 
             # Calculate the variance of each latent factor
             latent_variances = np.var(latent_factors, axis=0)
 
             # Calculate the total variance of the original data
-            total_variance = np.var(X_scaled, axis=0).sum()
+            total_variance = np.var(X, axis=0).sum()
 
             # Calculate the explained variance ratio for each latent factor
             explained_variance_ratios = latent_variances / total_variance
@@ -149,7 +177,7 @@ class Autoencoder:
 
             # Calculate reconstruction errors
             reconstruction_errors = torch.mean(
-                (torch.tensor(X_scaled, dtype=torch.float32) - reconstructed) ** 2,
+                (torch.tensor(X, dtype=torch.float32) - reconstructed) ** 2,
                 dim=1,
             ).numpy()
 
@@ -225,6 +253,61 @@ class Autoencoder:
 
         # Start Netron to visualize the model
         netron.start(onnx_path)
+
+    def tunning_train(self):
+        best_val_loss = float("inf")
+        patience = 20
+        epochs_without_improvement = 0
+        train_losses, val_losses = [], []
+
+        for epoch in range(2000):
+            self.model.train()
+            train_loss = 0
+            for batch_features, _ in self.train_loader:
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_features)
+                loss = self.criterion(outputs, batch_features)
+                loss.backward()
+                self.optimizer.step()
+                train_loss += loss.item() * batch_features.size(0)
+            train_losses.append(train_loss / len(self.train_loader.dataset))
+
+            # Validation step
+            self.model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch_features, _ in self.val_loader:
+                    outputs = self.model(batch_features)
+                    loss = self.criterion(outputs, batch_features)
+                    val_loss += loss.item() * batch_features.size(0)
+            val_losses.append(val_loss / len(self.val_loader.dataset))
+            self.scheduler.step(val_loss)
+
+            if is_nni_running():
+                # Report intermediate results to NNI
+                nni.report_intermediate_result(
+                    {
+                        "train_loss": train_loss / len(self.train_loader.dataset),
+                        "val_loss": val_loss / len(self.val_loader.dataset),
+                    }
+                )
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
+
+        # Get the entire training dataset
+        train_data = self.train_loader.dataset.data.numpy()
+
+        # Report final result to NNI
+        explained_variance_ratio_total = self.evaluate_on_data(train_data)[3]
+        nni.report_final_result(explained_variance_ratio_total)
 
 
 # preict the generated factors with the original factors
@@ -336,3 +419,55 @@ class LassoAnalysis:
         plt.ylabel("Factor")
         plt.tight_layout()
         plt.show()
+
+
+# Run the NNI experiment
+if __name__ == "__main__":
+    code_dir = Path(os.getcwd())
+    print(code_dir)
+    data_path = code_dir / "data"
+    assert os.path.exists(
+        data_path
+    ), "Data directory not found. Make sure you're running this code from the root directory of the project."
+
+    with open(data_path / "cbcl_data_remove_unrelated.csv", "r", encoding="utf-8") as f:
+        qns = pd.read_csv(f)
+
+    X = qns.iloc[:, 2:].values
+
+    # Standardize the data
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Split into training and validation sets
+    X_train_raw, X_temp = train_test_split(X, test_size=0.4)
+    X_val_raw, X_test_raw = train_test_split(X_temp, test_size=0.5)
+
+    X_train = scaler.fit_transform(X_train_raw)
+    X_val = scaler.transform(X_val_raw)
+    X_test = scaler.transform(X_test_raw)
+
+    # 获取 NNI 参数
+    if is_nni_running():
+        params = nni.get_next_parameter()
+        layer1_neurons = params.get("layer1_neurons", 19)
+        layer2_neurons = params.get("layer2_neurons", 79)
+        layer3_neurons = params.get("layer3_neurons", 75)
+    else:
+        layer1_neurons, layer2_neurons, layer3_neurons = 19, 79, 75
+        print("NNI is not running")
+
+    # Initialize Autoencoder
+    autoencoder = Autoencoder(
+        X_train,
+        X_val,
+        encoding_dim=5,
+        layer1_neurons=layer1_neurons,
+        layer2_neurons=layer2_neurons,
+        layer3_neurons=layer3_neurons,
+    )
+
+    if is_nni_running():
+        autoencoder.tunning_train()
+    else:
+        print("NNI is not running")

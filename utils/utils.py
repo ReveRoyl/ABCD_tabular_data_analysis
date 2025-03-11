@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import time
@@ -6,10 +7,8 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
-import os
 
 # --------------------------------------------------------------------------------------------------
-
 
 def get_cbcl_details(cbcl_item):
     """
