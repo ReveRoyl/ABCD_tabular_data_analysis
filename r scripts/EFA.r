@@ -1,54 +1,21 @@
-# 加载 psych 包
-# install.packages("psych")
 library(psych)
-
+setwd('G:\\ABCD\\script\\trail\\data')
 # 设置数据路径并加载数据
-data_path <- "data"
-data <- read.csv(file.path(data_path, "labels.csv"))
-# data_path <- "G:/ABCD/script/trail/trail_tsne_RF/test"
-# data <- read.csv(file.path(data_path, "all_year_labels.csv"))
-setwd(file.path(data_path, "/output/"))
-
-# 删除指定列
-# data <- data[, !(names(data) %in% c("Unnamed: 0", "src_subject_id"))]
-
-# 选择以 "cbcl" 开头的列
-label_columns <- c("src_subject_id", grep("^cbcl", names(data), value = TRUE))
-data <- data[, label_columns]
-
-# 假设数据框的第一列是 ID 列，我们将其单独保留出来
-id_column <- data[, 1, drop = FALSE]  # 保留原始的第一列 (ID 列)
-data_to_clean <- data[, -1]  # 提取从第二列开始的数据进行清理
-
-# Step 2: 找到并移除低频项（列）
-# 移除低频率（超过 99.5% 为 0）的列
-low_frequency_columns <- names(data_to_clean)[sapply(data_to_clean, function(col) mean(col == 0) > 0.995)]
-data_cleaned <- data_to_clean[, !(names(data_to_clean) %in% low_frequency_columns)]
-
-# 输出被移除的列
-cat("Removed columns with low frequency:", low_frequency_columns, "\n")
-
-# Step 3: 找到并移除低频项（行）
-# 移除低频率（超过 99.5% 为 0）的行
-low_frequency_rows <- apply(data_cleaned, 1, function(row) mean(row == 0) > 0.995)
-data_cleaned <- data_cleaned[!low_frequency_rows, ]
-
-# 输出被移除的行
-cat("Removed rows with low frequency:", which(low_frequency_rows), "\n")
-
-
-
+data_path <- file.path(getwd(), "..", "data")
+data <- read.csv(file.path(data_path, "/cbcl_data_remove_unrelated.csv"))
+#first column is ID
+data_cleaned <- data[, -1]
+id <- data[, 1]
 # Step 2: 计算 Polychoric 相关矩阵
 polychoric_corr <- polychoric(data_cleaned)$rho  # 使用 $rho 获取相关系数矩阵
-
 
 # 保存 Polychoric 相关矩阵到 CSV 文件
 write.csv(polychoric_corr, file = file.path(data_path, "correlation.csv"), row.names = TRUE)
 
+# ------------------------------------------------------------------------------
 ### 对数据降维, 使用EFA ### \
 # 进行因子分析
 fa_result <- fa(data_cleaned, nfactors = 5, rotate = "geominQ", fm = "pa")
-
 
 # 查看因子分析结果
 
@@ -67,8 +34,8 @@ id_column_cleaned <- id_column[!low_frequency_rows, , drop = FALSE]
 factor_scores <- cbind(id_column_cleaned, factor_scores)
 write.csv(factor_scores, file = "EFA.csv", row.names = TRUE)
 
-# ---------------------------------------------------------------------------------------------------------------------------------------
-### 对数据降维, 使用NMF ### 
+# ------------------------------------------------------------------------------
+### 对数据降维, 使用NMF
 # 加载 NMF 包
 library(NMF)
 # 假设你有一个非负矩阵 data_matrix
@@ -121,17 +88,8 @@ variance_explained <- reconstructed_variance / total_variance
 cat("Variance explained by the NMF model:", variance_explained * 100, "%\n")
 
 
-
-
-# Step 4: 将原始的 ID 列合并回清理后的数据框，并确保行对齐
-# 保留没有被移除行的 ID 列
-id_column_cleaned <- id_column[!low_frequency_rows, , drop = FALSE]
-data_cleaned <- cbind(id_column_cleaned, data_cleaned)
-
-W <- cbind(id_column_cleaned, W)
+W <- cbind(id, W)
 H_transposed = t(H)
 # write.csv(H_transposed, file = "nmf_H.csv", row.names = TRUE)
 #save W and data_cleaned
 # write.csv(W, file = "nmf_W.csv", row.names = TRUE)
-
-# write.csv(data_cleaned, file = "data_cleaned.csv", row.names = TRUE)
