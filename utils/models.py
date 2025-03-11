@@ -17,6 +17,7 @@ from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from sklearn.model_selection import KFold
 
 
 # --------------------------------------------------------------------------------------------------
@@ -100,6 +101,7 @@ class Autoencoder:
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.1, patience=5
         )
+        self.explained_variance_ratio_total_value = None
 
     def train(self):
         best_val_loss = float("inf")
@@ -172,8 +174,8 @@ class Autoencoder:
             explained_variance_ratios = latent_variances / total_variance
 
             # Print the explained variance ratio for each latent factor
-            for i, ratio in enumerate(explained_variance_ratios):
-                print(f"Explained variance ratio of latent factor {i+1}: {ratio:.8f}")
+            # for i, ratio in enumerate(explained_variance_ratios):
+            #     print(f"Explained variance ratio of latent factor {i+1}: {ratio:.8f}")
 
             # Calculate reconstruction errors
             reconstruction_errors = torch.mean(
@@ -186,9 +188,9 @@ class Autoencoder:
 
             # Calculate the total explained variance ratio
             explained_variance_ratio_total = reconstruction_variance / total_variance
-            print(
-                f"Total explained variance ratio (by all factors): {explained_variance_ratio_total:.8f}"
-            )
+            # print(
+            #     f"Total explained variance ratio (by all factors): {explained_variance_ratio_total:.8f}"
+            # )
 
         return (
             latent_factors,
@@ -302,14 +304,10 @@ class Autoencoder:
                     print(f"Early stopping at epoch {epoch + 1}")
                     break
 
-        # Get the entire training dataset
-        train_data = self.train_loader.dataset.data.numpy()
-
-        # Report final result to NNI
-        explained_variance_ratio_total = self.evaluate_on_data(train_data)[3]
-        nni.report_final_result(explained_variance_ratio_total)
-
-
+    def explained_variance_ratio_total(self, X_test):
+        self.explained_variance_ratio_total_value = self.evaluate_on_data(X_test)[3]
+        return self.explained_variance_ratio_total_value
+ 
 # preict the generated factors with the original factors
 class LassoAnalysis:
     """
@@ -421,6 +419,59 @@ class LassoAnalysis:
         plt.show()
 
 
+# # Run the NNI experiment
+# if __name__ == "__main__":
+#     code_dir = Path(os.getcwd())
+#     print(code_dir)
+#     data_path = code_dir / "data"
+#     assert os.path.exists(
+#         data_path
+#     ), "Data directory not found. Make sure you're running this code from the root directory of the project."
+
+#     with open(data_path / "cbcl_data_remove_unrelated.csv", "r", encoding="utf-8") as f:
+#         qns = pd.read_csv(f)
+
+#     X = qns.iloc[:, 2:].values
+
+#     # Standardize the data
+#     scaler = MinMaxScaler()
+#     X_scaled = scaler.fit_transform(X)
+
+#     # Split into training and validation sets
+#     X_train_raw, X_temp = train_test_split(X, test_size=0.4)
+#     X_val_raw, X_test_raw = train_test_split(X_temp, test_size=0.5)
+
+#     X_train = scaler.fit_transform(X_train_raw)
+#     X_val = scaler.transform(X_val_raw)
+#     X_test = scaler.transform(X_test_raw)
+
+#     # 获取 NNI 参数
+#     if is_nni_running():
+#         params = nni.get_next_parameter()
+#         layer1_neurons = params.get("layer1_neurons")
+#         layer2_neurons = params.get("layer2_neurons")
+#         layer3_neurons = params.get("layer3_neurons")
+#     else:
+#         layer1_neurons, layer2_neurons, layer3_neurons = 69, 58, 53
+
+#     # Initialize Autoencoder
+#     autoencoder = Autoencoder(
+#         X_train,
+#         X_val,
+#         encoding_dim=5,
+#         layer1_neurons=layer1_neurons,
+#         layer2_neurons=layer2_neurons,
+#         layer3_neurons=layer3_neurons,
+#     )
+
+#     if is_nni_running():
+#         autoencoder.tunning_train()
+#     else:
+#         print("NNI is not running")
+#         autoencoder.tunning_train()
+
+#     nni.report_final_result(autoencoder.explained_variance_ratio_total_value)
+
 # Run the NNI experiment
 if __name__ == "__main__":
     code_dir = Path(os.getcwd())
@@ -437,37 +488,47 @@ if __name__ == "__main__":
 
     # Standardize the data
     scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X)
+    variances_explained = []
 
-    # Split into training and validation sets
-    X_train_raw, X_temp = train_test_split(X, test_size=0.4)
-    X_val_raw, X_test_raw = train_test_split(X_temp, test_size=0.5)
-
+    X_train_raw, X_test_raw = train_test_split(X, test_size=0.2)
     X_train = scaler.fit_transform(X_train_raw)
-    X_val = scaler.transform(X_val_raw)
     X_test = scaler.transform(X_test_raw)
+    # Split into training and validation sets using 10-fold cross-validation
+    kf = KFold(n_splits=10, shuffle=True)
+    fold = 1
 
-    # 获取 NNI 参数
-    if is_nni_running():
-        params = nni.get_next_parameter()
-        layer1_neurons = params.get("layer1_neurons", 19)
-        layer2_neurons = params.get("layer2_neurons", 79)
-        layer3_neurons = params.get("layer3_neurons", 75)
-    else:
-        layer1_neurons, layer2_neurons, layer3_neurons = 19, 79, 75
-        print("NNI is not running")
+    for train_index, val_index in kf.split(X_train):
+        print(f"Fold {fold}")
+        X_train_fold, X_val_fold = X_train[train_index], X_train[val_index]
 
-    # Initialize Autoencoder
-    autoencoder = Autoencoder(
-        X_train,
-        X_val,
-        encoding_dim=5,
-        layer1_neurons=layer1_neurons,
-        layer2_neurons=layer2_neurons,
-        layer3_neurons=layer3_neurons,
-    )
+        if is_nni_running():
+            params = nni.get_next_parameter()
+            layer1_neurons = params.get("layer1_neurons")
+            layer2_neurons = params.get("layer2_neurons")
+            layer3_neurons = params.get("layer3_neurons")
+        else:
+            layer1_neurons, layer2_neurons, layer3_neurons = 69, 58, 53
 
-    if is_nni_running():
-        autoencoder.tunning_train()
-    else:
-        print("NNI is not running")
+        # Initialize Autoencoder
+        autoencoder = Autoencoder(
+            X_train_fold,
+            X_val_fold,
+            encoding_dim=5,
+            layer1_neurons=layer1_neurons,
+            layer2_neurons=layer2_neurons,
+            layer3_neurons=layer3_neurons,
+        )
+
+        if is_nni_running():
+            autoencoder.tunning_train()
+        else:
+            print("NNI is not running")
+            autoencoder.tunning_train()
+
+        
+        fold += 1
+        
+        variances_explained.append(autoencoder.explained_variance_ratio_total(X_test))
+        print(f"Explained variance ratio: {autoencoder.explained_variance_ratio_total(X_test)}")
+    average_variances_explained = np.mean(variances_explained)
+    nni.report_final_result(average_variances_explained)
