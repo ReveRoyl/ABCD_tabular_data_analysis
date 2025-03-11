@@ -4,7 +4,10 @@ This repository contains code for factor analysis using autoencoder.
 
 ## Data pre-processing
 
-For data preprocessing, run `notebooks/data_preparation.ipynb` first and run `r_scripts/remove_unrelated.r`
+The dataset used in this project is proprietary and cannot be shared publicly due to confidentiality agreements.
+For more details on obtaining the dataset, please check the official documentation or reach out to the appropriate contacts.
+
+For data preprocessing, run `notebooks/data_preparation.ipynb` first and then run `r_scripts/remove_unrelated.r`
 
 ## Installation
 
@@ -14,4 +17,4 @@ To install this package, clone the repository and run `pip install -e .` from th
 
 An example notebook is provided in the `notebooks` directory.
 
-To Use nni for tunning, `config.yml` and `search_space.json` are provided, run `nnictl create --config config.yml` from the root directory.
+To use NNI for tunning, `config.yml` and `search_space.json` are provided, run `nnictl create --config config.yml` from the root directory.
