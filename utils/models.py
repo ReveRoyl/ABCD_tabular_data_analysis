@@ -419,59 +419,6 @@ class LassoAnalysis:
         plt.show()
 
 
-# # Run the NNI experiment
-# if __name__ == "__main__":
-#     code_dir = Path(os.getcwd())
-#     print(code_dir)
-#     data_path = code_dir / "data"
-#     assert os.path.exists(
-#         data_path
-#     ), "Data directory not found. Make sure you're running this code from the root directory of the project."
-
-#     with open(data_path / "cbcl_data_remove_unrelated.csv", "r", encoding="utf-8") as f:
-#         qns = pd.read_csv(f)
-
-#     X = qns.iloc[:, 2:].values
-
-#     # Standardize the data
-#     scaler = MinMaxScaler()
-#     X_scaled = scaler.fit_transform(X)
-
-#     # Split into training and validation sets
-#     X_train_raw, X_temp = train_test_split(X, test_size=0.4)
-#     X_val_raw, X_test_raw = train_test_split(X_temp, test_size=0.5)
-
-#     X_train = scaler.fit_transform(X_train_raw)
-#     X_val = scaler.transform(X_val_raw)
-#     X_test = scaler.transform(X_test_raw)
-
-#     # 获取 NNI 参数
-#     if is_nni_running():
-#         params = nni.get_next_parameter()
-#         layer1_neurons = params.get("layer1_neurons")
-#         layer2_neurons = params.get("layer2_neurons")
-#         layer3_neurons = params.get("layer3_neurons")
-#     else:
-#         layer1_neurons, layer2_neurons, layer3_neurons = 69, 58, 53
-
-#     # Initialize Autoencoder
-#     autoencoder = Autoencoder(
-#         X_train,
-#         X_val,
-#         encoding_dim=5,
-#         layer1_neurons=layer1_neurons,
-#         layer2_neurons=layer2_neurons,
-#         layer3_neurons=layer3_neurons,
-#     )
-
-#     if is_nni_running():
-#         autoencoder.tunning_train()
-#     else:
-#         print("NNI is not running")
-#         autoencoder.tunning_train()
-
-#     nni.report_final_result(autoencoder.explained_variance_ratio_total_value)
-
 # Run the NNI experiment
 if __name__ == "__main__":
     code_dir = Path(os.getcwd())
@@ -486,6 +433,8 @@ if __name__ == "__main__":
 
     X = qns.iloc[:, 2:].values
 
+    if is_nni_running():
+        params = nni.get_next_parameter()
     # Standardize the data
     scaler = MinMaxScaler()
     variances_explained = []
@@ -500,9 +449,7 @@ if __name__ == "__main__":
     for train_index, val_index in kf.split(X_train):
         print(f"Fold {fold}")
         X_train_fold, X_val_fold = X_train[train_index], X_train[val_index]
-
         if is_nni_running():
-            params = nni.get_next_parameter()
             layer1_neurons = params.get("layer1_neurons")
             layer2_neurons = params.get("layer2_neurons")
             layer3_neurons = params.get("layer3_neurons")
