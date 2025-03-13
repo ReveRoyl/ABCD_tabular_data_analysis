@@ -90,6 +90,6 @@ cat("Variance explained by the NMF model:", variance_explained * 100, "%\n")
 
 W <- cbind(id, W)
 H_transposed = t(H)
-# write.csv(H_transposed, file = "nmf_H.csv", row.names = TRUE)
+write.csv(H_transposed, file = "nmf_H.csv", row.names = TRUE)
 #save W and data_cleaned
-# write.csv(W, file = "nmf_W.csv", row.names = TRUE)
+write.csv(W, file = "nmf_W.csv", row.names = TRUE)

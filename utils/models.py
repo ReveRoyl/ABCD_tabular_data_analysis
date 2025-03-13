@@ -18,8 +18,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from sklearn.model_selection import KFold
-
-
+import torch.nn.functional as F
 # --------------------------------------------------------------------------------------------------
 class QuestionnaireDataset(Dataset):
     def __init__(self, data):
@@ -73,6 +72,19 @@ def is_nni_running():
     return "NNI_PLATFORM" in os.environ
 
 
+def decorrelation_loss(latent_repr):
+    """
+    计算潜在表示的去相关正则化损失。
+    latent_repr: (batch_size, latent_dim)
+    """
+    batch_size, latent_dim = latent_repr.shape
+    # 计算协方差矩阵
+    latent_repr = latent_repr - latent_repr.mean(dim=0, keepdim=True)  # 先中心化
+    cov_matrix = (latent_repr.T @ latent_repr) / batch_size  # 计算协方差
+    mask = torch.eye(latent_dim, device=latent_repr.device)  # 生成单位矩阵
+    loss = torch.sum((cov_matrix * (1 - mask))**2)  # 只计算非对角元素
+    return loss
+
 class Autoencoder:
     def __init__(
         self,
@@ -103,22 +115,31 @@ class Autoencoder:
         )
         self.explained_variance_ratio_total_value = None
 
-    def train(self):
+    def train(self, show_plot=False):
         best_val_loss = float("inf")
         patience = 20
         epochs_without_improvement = 0
         train_losses, val_losses = [], []
 
+        # Modify the training loop to include decorrelation loss
         for epoch in range(2000):
             self.model.train()
             train_loss = 0
             for batch_features, _ in self.train_loader:
                 self.optimizer.zero_grad()
                 outputs = self.model(batch_features)
-                loss = self.criterion(outputs, batch_features)
-                loss.backward()
+                reconstruction_loss = self.criterion(outputs, batch_features)
+                
+                # Calculate decorrelation loss
+                latent_repr = self.model.encoder(batch_features)
+                decorrelation_loss_value = decorrelation_loss(latent_repr)
+                
+                # Combine losses
+                combined_loss = reconstruction_loss + decorrelation_loss_value
+                
+                combined_loss.backward()
                 self.optimizer.step()
-                train_loss += loss.item() * batch_features.size(0)
+                train_loss += combined_loss.item() * batch_features.size(0)
             train_losses.append(train_loss / len(self.train_loader.dataset))
 
             # Validation step
@@ -127,8 +148,16 @@ class Autoencoder:
             with torch.no_grad():
                 for batch_features, _ in self.val_loader:
                     outputs = self.model(batch_features)
-                    loss = self.criterion(outputs, batch_features)
-                    val_loss += loss.item() * batch_features.size(0)
+                    reconstruction_loss = self.criterion(outputs, batch_features)
+                    
+                    # Calculate decorrelation loss
+                    latent_repr = self.model.encoder(batch_features)
+                    decorrelation_loss_value = decorrelation_loss(latent_repr)
+                    
+                    # Combine losses
+                    combined_loss = reconstruction_loss + decorrelation_loss_value
+                    
+                    val_loss += combined_loss.item() * batch_features.size(0)
             val_losses.append(val_loss / len(self.val_loader.dataset))
             self.scheduler.step(val_loss)
 
@@ -142,14 +171,15 @@ class Autoencoder:
                     print(f"Early stopping at epoch {epoch + 1}")
                     break
 
-        # Plot loss curves
-        plt.plot(train_losses, label="Train Loss")
-        plt.plot(val_losses, label="Validation Loss")
-        plt.legend()
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Loss Curves")
-        plt.show()
+        if show_plot:
+            # Plot loss curves
+            plt.plot(train_losses, label="Train Loss")
+            plt.plot(val_losses, label="Validation Loss")
+            plt.legend()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("Loss Curves")
+            plt.show()
 
     def evaluate_on_data(self, X):
         self.model.eval()
@@ -419,63 +449,81 @@ class LassoAnalysis:
         plt.show()
 
 
-# Run the NNI experiment
+# --------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
+    # load data
     code_dir = Path(os.getcwd())
-    print(code_dir)
     data_path = code_dir / "data"
-    assert os.path.exists(
-        data_path
-    ), "Data directory not found. Make sure you're running this code from the root directory of the project."
-
+    assert os.path.exists(data_path), "Cannot find data folder, please run the code in root directory of the project."
+    
     with open(data_path / "cbcl_data_remove_unrelated.csv", "r", encoding="utf-8") as f:
         qns = pd.read_csv(f)
-
+    
     X = qns.iloc[:, 2:].values
 
+    # outer cv
+    outer_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    outer_scores = []
+
+    # passing hyperparameters
     if is_nni_running():
         params = nni.get_next_parameter()
-    # Standardize the data
-    scaler = MinMaxScaler()
-    variances_explained = []
-
-    X_train_raw, X_test_raw = train_test_split(X, test_size=0.2)
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test = scaler.transform(X_test_raw)
-    # Split into training and validation sets using 10-fold cross-validation
-    kf = KFold(n_splits=10, shuffle=True)
-    fold = 1
-
-    for train_index, val_index in kf.split(X_train):
-        print(f"Fold {fold}")
-        X_train_fold, X_val_fold = X_train[train_index], X_train[val_index]
-        if is_nni_running():
-            layer1_neurons = params.get("layer1_neurons")
-            layer2_neurons = params.get("layer2_neurons")
-            layer3_neurons = params.get("layer3_neurons")
-        else:
-            layer1_neurons, layer2_neurons, layer3_neurons = 69, 58, 53
-
-        # Initialize Autoencoder
-        autoencoder = Autoencoder(
-            X_train_fold,
-            X_val_fold,
+        layer1_neurons = params.get("layer1_neurons")
+        layer2_neurons = params.get("layer2_neurons")
+        layer3_neurons = params.get("layer3_neurons")
+    else:
+        layer1_neurons, layer2_neurons, layer3_neurons = 69, 58, 53
+    
+    for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(outer_cv.split(X), start=1):
+        print(f"====== Outer Fold {outer_fold} ======")
+        X_outer_train_raw, X_outer_test_raw = X[outer_train_idx], X[outer_test_idx]
+        
+        scaler_fold = MinMaxScaler()
+        X_outer_train = scaler_fold.fit_transform(X_outer_train_raw)
+        X_outer_test = scaler_fold.transform(X_outer_test_raw)
+        
+        # inner cv
+        inner_cv = KFold(n_splits=10, shuffle=True, random_state=42)
+        inner_scores = []
+        for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(inner_cv.split(X_outer_train), start=1):
+            print(f"  -- Inner Fold {inner_fold}")
+            X_inner_train = X_outer_train[inner_train_idx]
+            X_inner_val = X_outer_train[inner_val_idx]
+            
+            autoencoder_inner = Autoencoder(
+                X_inner_train,
+                X_inner_val,
+                encoding_dim=5,
+                layer1_neurons=layer1_neurons,
+                layer2_neurons=layer2_neurons,
+                layer3_neurons=layer3_neurons,
+            )
+            
+            # train in inner fold and evaluate in inner fold
+            autoencoder_inner.tunning_train()
+            inner_score = autoencoder_inner.explained_variance_ratio_total(X_inner_val)
+            print(f"Inner fold explained variance: {inner_score}")
+            inner_scores.append(inner_score)
+        
+        avg_inner_score = np.mean(inner_scores)
+        print(f"Average inner CV score for outer fold {outer_fold}: {avg_inner_score}")
+        
+        # Train on the entire outer training set and evaluate on the outer test set
+        autoencoder_outer = Autoencoder(
+            X_outer_train,
+            X_outer_test,
             encoding_dim=5,
             layer1_neurons=layer1_neurons,
             layer2_neurons=layer2_neurons,
             layer3_neurons=layer3_neurons,
         )
-
-        if is_nni_running():
-            autoencoder.tunning_train()
-        else:
-            print("NNI is not running")
-            autoencoder.tunning_train()
-
-        
-        fold += 1
-        
-        variances_explained.append(autoencoder.explained_variance_ratio_total(X_test))
-        print(f"Explained variance ratio: {autoencoder.explained_variance_ratio_total(X_test)}")
-    average_variances_explained = np.mean(variances_explained)
-    nni.report_final_result(average_variances_explained)
+        autoencoder_outer.tunning_train()
+        outer_score = autoencoder_outer.explained_variance_ratio_total(X_outer_test)
+        print(f"Outer fold {outer_fold} test explained variance: {outer_score}")
+        outer_scores.append(outer_score)
+    
+    final_avg_score = np.mean(outer_scores)
+    print("Final average test explained variance:", final_avg_score)
+    
+    # report final result
+    nni.report_final_result(final_avg_score)

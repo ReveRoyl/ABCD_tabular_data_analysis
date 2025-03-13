@@ -63,9 +63,9 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------------------------------
 
 
-def translate_text(df, number_of_factors, language):
+def translate_text(df, language):
     """ 
-    Input DataFrame df (in the form of Row_Name1, Row_Name2), number of factors, and language (string)
+    Input DataFrame df (in the form of Row_Name1, Row_Name2, as the number of factors)and language (string)
     
     Returns: a DataFrame containing translated detailed information 
     """
@@ -88,7 +88,7 @@ def translate_text(df, number_of_factors, language):
     # Regular expression to extract cbcl_q column names
     cbcl_pattern = re.compile(r"(cbcl_q\d+[a-z]*_p)")
 
-    for i in range(0, number_of_factors):
+    for i in range(0, len(df.columns)):
         # Filter out loading values that meet the criteria
         # factor_values = df[f"Factor {i}"][df[f"Factor {i}"] > 0.1]
 

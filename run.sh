@@ -10,7 +10,4 @@
 
 nnictl stop --all
 
-nnictl create --config config.yml
-
-nnictl get
-
+nnictl create --config config.yml --port 8081
