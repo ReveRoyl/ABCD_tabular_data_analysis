@@ -114,7 +114,10 @@ class Autoencoder:
             self.optimizer, mode="min", factor=0.1, patience=5
         )
         self.explained_variance_ratio_total_value = None
-
+    
+    def get_model(self):
+        return self.model
+    
     def train(self, show_plot=False):
         best_val_loss = float("inf")
         patience = 20

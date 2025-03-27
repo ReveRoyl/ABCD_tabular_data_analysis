@@ -164,7 +164,8 @@ class GetfMRIdata:
         query = """
         SELECT ENDPOINT
         FROM S3_LINKS
-        WHERE ENDPOINT LIKE '%baseline%' AND ENDPOINT LIKE '%rsfMRI%' AND ENDPOINT LIKE '%NDARINV005V6D2C%' AND ENDPOINT LIKE '%MPROC%' 
+        WHERE ENDPOINT LIKE '%baseline%' AND (ENDPOINT LIKE '%rsfMRI%' OR ENDPOINT LIKE '%T1%') AND ENDPOINT LIKE '%MPROC%' 
+        --AND ENDPOINT LIKE '%NDARINV05ATJ1V1%'
         """
         cursor.execute(query)
         self.s3_samples = [row[0] for row in cursor.fetchall()]
