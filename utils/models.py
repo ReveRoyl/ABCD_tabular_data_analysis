@@ -31,7 +31,7 @@ class QuestionnaireDataset(Dataset):
         return self.data[idx], self.data[idx]  # Input and target are the same
 
 
-# Step 2: Define the autoencoder architecture
+# the autoencoder architecture
 class AutoencoderModel(nn.Module):
     def __init__(
         self, input_dim, latent_dim, layer1_neurons, layer2_neurons, layer3_neurons
@@ -301,7 +301,13 @@ class Autoencoder:
             for batch_features, _ in self.train_loader:
                 self.optimizer.zero_grad()
                 outputs = self.model(batch_features)
-                loss = self.criterion(outputs, batch_features)
+                reconstruction_loss = self.criterion(outputs, batch_features)
+                # Calculate decorrelation loss
+                latent_repr = self.model.encoder(batch_features)
+                decorrelation_loss_value = decorrelation_loss(latent_repr)
+                
+                # Combine losses
+                loss = reconstruction_loss + decorrelation_loss_value
                 loss.backward()
                 self.optimizer.step()
                 train_loss += loss.item() * batch_features.size(0)
@@ -313,7 +319,14 @@ class Autoencoder:
             with torch.no_grad():
                 for batch_features, _ in self.val_loader:
                     outputs = self.model(batch_features)
-                    loss = self.criterion(outputs, batch_features)
+                    reconstruction_loss = self.criterion(outputs, batch_features)
+                    # Calculate decorrelation loss
+                    latent_repr = self.model.encoder(batch_features)
+                    decorrelation_loss_value = decorrelation_loss(latent_repr)
+                    
+                    # Combine losses
+                    loss = reconstruction_loss + decorrelation_loss_value
+                    
                     val_loss += loss.item() * batch_features.size(0)
             val_losses.append(val_loss / len(self.val_loader.dataset))
             self.scheduler.step(val_loss)

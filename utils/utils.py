@@ -22,7 +22,7 @@ def get_cbcl_details(cbcl_item):
     """
     # Parse the element.html file
     with open(
-        r"G:\ABCD\script\trail\trail_tsne_RF\factor analysis\data\element.html",
+        r"../data/element.html",
         "r",
         encoding="utf-8",
     ) as file:

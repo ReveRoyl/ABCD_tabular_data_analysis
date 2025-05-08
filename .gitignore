@@ -7,5 +7,7 @@
 __pycache__/
 *.egg-info/
 output/
+data/fmriresults01
+data/image03
 *nii
 *tsv
