@@ -9,5 +9,9 @@ __pycache__/
 output/
 data/fmriresults01
 data/image03
+.vs/
 *nii
 *tsv
+*.sh
+*.yml
+*.json

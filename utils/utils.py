@@ -7,7 +7,13 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
-
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import textwrap
 # --------------------------------------------------------------------------------------------------
 
 def get_cbcl_details(cbcl_item):
@@ -199,3 +205,117 @@ class GetfMRIdata:
         self.fetch_data()
         self.save_data()
         self.close_connection()
+
+def find_column_in_csvs(root_folder, target_column, case_insensitive=True, verbose=True):
+    """
+    Search for CSV files under a root directory that contain a specific column name.
+
+    Parameters:
+    - root_folder (str): Root folder path containing CSV files
+    - target_column (str): The column name or substring to search for
+    - case_insensitive (bool): Whether to ignore case when matching (default: True)
+    - verbose (bool): Whether to print the results (default: True)
+
+    Returns:
+    - found_files (list of tuples): List of (file_path, matching_column)
+    """
+    found_files = []
+
+    for dirpath, dirnames, filenames in os.walk(root_folder):
+        for filename in filenames:
+            if filename.lower().endswith('.csv'):
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    df = pd.read_csv(file_path, nrows=1)
+                    for col in df.columns:
+                        col_check = col.lower() if case_insensitive else col
+                        target_check = target_column.lower() if case_insensitive else target_column
+                        if target_check in col_check:
+                            found_files.append((file_path, col))
+                except Exception as e:
+                    if verbose:
+                        print(f'⚠️ Failed to read file {file_path}: {e}')
+    
+    if verbose:
+        if found_files:
+            for path, column in found_files:
+                print(f'✅ Found column "{column}" in file: {path}')
+        else:
+            print(f'❌ Column "{target_column}" was not found in any file.')
+
+    return found_files
+
+
+
+def wrap_labels(labels, width=20):
+    return [textwrap.fill(label, width) for label in labels]
+
+def compute_autoencoder_loadings_with_plot(latent_factors, X_train, items, top_k=8):
+    """
+    Compute the autoencoder "loading matrix" and visualize, for each latent factor,
+    the top_k original features with the largest absolute loadings.
+
+    Parameters
+    ----------
+    latent_factors : np.ndarray or pd.DataFrame
+        Latent factor representations produced by the autoencoder encoder,
+        shape (n_samples, n_latent_factors).
+    X_train : np.ndarray or pd.DataFrame
+        Original input features, shape (n_samples, n_original_features).
+    items : list or array-like
+        Names of the original features; length must match X_train.shape[1].
+    top_k : int, default=8
+        Number of top original features (by absolute loading) to visualize per latent factor.
+
+    Returns
+    -------
+    loadings_df : pd.DataFrame
+        Loading matrix as a DataFrame, with rows corresponding to original features
+        and columns corresponding to latent factors.
+    """
+
+    # 转换为 numpy 数组
+    latent_factors = (
+        latent_factors.values if isinstance(latent_factors, pd.DataFrame) else latent_factors
+    )
+    original_features = (
+        X_train.values if isinstance(X_train, pd.DataFrame) else X_train
+    )
+
+    n_original_features = original_features.shape[1]
+    n_latent_factors = latent_factors.shape[1]
+
+    # 标准化 latent_factors
+    scaler = StandardScaler()
+    latent_factors_scaled = scaler.fit_transform(latent_factors)
+
+    loadings = []
+    # 对每个原始特征回归
+    for i in range(n_original_features):
+        y = original_features[:, i]
+        reg = LinearRegression().fit(latent_factors_scaled, y)
+        loadings.append(reg.coef_)
+
+    loadings_df = pd.DataFrame(
+        loadings,
+        index=items,
+        columns=[f"Latent_{j+1}" for j in range(n_latent_factors)]
+    )
+
+    # ==== 可视化 ====
+    sns.set(style='whitegrid')
+    for col in loadings_df.columns:
+        # 取绝对值 top_k 特征
+        top_items = loadings_df[col].abs().sort_values(ascending=False).head(top_k).index
+        top_data = loadings_df.loc[top_items, [col]]
+        top_items_wrapped = wrap_labels(top_items, width=100)  # each label max 80 chars per line
+        # 绘制热力图
+        plt.figure(figsize=(6, 0.5*len(top_items_wrapped)))
+        sns.heatmap(top_data, annot=True, cmap='coolwarm', center=0, cbar=True, yticklabels=top_items_wrapped)
+        plt.title(f"Top {top_k} Loadings for {col}")
+        plt.xlabel("Latent Dimension")
+        plt.ylabel("Original Feature")
+        plt.tight_layout()
+        plt.show()
+
+    return loadings_df
