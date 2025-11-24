@@ -117,6 +117,11 @@ if (length(combo_map) > 0) {
 # Step 3: Save (rows are never removed)
 # ------------------------------------------------------------
 data_cleaned_final <- cbind(id_column, X_final)
+num_cols <- sapply(data_cleaned_final, is.numeric)
+data_cleaned_final[num_cols] <- lapply(data_cleaned_final[num_cols], function(x) {
+  r <- round(x)
+  return(r)
+})
 write.csv(data_cleaned_final, file = "cbcl_data_remove_low_frequency.csv", row.names = FALSE)
 
 # Log

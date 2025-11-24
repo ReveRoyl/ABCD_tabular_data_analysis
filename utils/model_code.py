@@ -1,6 +1,7 @@
 # model.py
 
 import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,8 +10,49 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+import random
 
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+# 先给个默认值，后面在 set_deterministic 里会用 global 覆盖
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_deterministic(seed: int):
+    """
+    全局随机种子固定 + 强制确定性算法（确保每次结果完全一样）
+    注意：需要在主脚本最开始设置好环境变量后调用。
+    """
+    global device  # 关键：同时更新本模块里的全局 device
+
+    # 固定 Python、NumPy、Torch 随机性
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # 确保 cuDNN / matmul 确定性
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    # PyTorch ≥ 1.9: 强制启用确定性算法
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception as e:
+        print(f"Warning: deterministic_algorithms not fully supported: {e}")
+
+    # 自动选择设备，并更新本模块的全局 device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[Seed fixed] random/numpy/torch all set to {seed}")
+    print(f"Using device: {device}")
+
+    return device
 
 
 def is_nni_running():
@@ -28,6 +70,67 @@ class QuestionnaireDataset(Dataset):
         return self.data[idx], self.data[idx]
 
 
+# ======== 统一的 total_evr 计算工具函数（残差方差法，样本方差 ddof=1） ========
+
+def _total_evr_from_recon(X_np: np.ndarray, recon_np: np.ndarray, ddof: int = 1) -> float:
+    """
+    Compute total explained variance ratio from reconstruction residual variance:
+      total_evr = 1 - sum_j Var(X_j - recon_j) / sum_j Var(X_j)
+    - Uses sample variance (ddof=1)
+    - Automatically ignores columns with Var(X_j) == 0
+    - Clips the result to [0, 1]
+    """
+    resid = X_np - recon_np
+    var_x = np.var(X_np, axis=0, ddof=ddof)
+    mask = var_x > 0
+    if not np.any(mask):
+        return 0.0
+    num = np.var(resid[:, mask], axis=0, ddof=ddof).sum()
+    den = var_x[mask].sum()
+    evr = 1.0 - (num / den)
+    return float(np.clip(evr, 0.0, 1.0))
+
+# -------------------------
+# R2 = 1 - SSE/SST, as columns
+# -------------------------
+def _total_r2_from_recon(X_np: np.ndarray, recon_np: np.ndarray) -> float:
+    Xc = X_np - X_np.mean(axis=0, keepdims=True)
+    sse = np.sum((X_np - recon_np) ** 2)
+    sst = np.sum(Xc ** 2)
+    return float(1.0 - sse / sst) if sst > 0 else np.nan
+
+def batch_swap_noise(x, swap_prob=0.15, generator=None):
+    """
+    Add batch swap noise to the input batch.
+    Args:
+        x: Tensor of shape [batch_size, input_dim]
+        swap_prob: Probability (0 - 1) that each feature will be swapped.
+    Returns:
+        x_noisy: Tensor with added noise.
+    """
+    batch_size, input_dim = x.shape
+
+    if generator is None:
+        generator = torch.default_generator  # fallback to global
+
+    # Randomly generate a mask
+    # mask = torch.rand_like(x, generator=generator) < swap_prob  # True indicates features to be swapped
+    rand_cpu = torch.rand(x.shape, generator=generator)  # CPU tensor
+    mask = (rand_cpu < swap_prob).to(x.device)
+    # Generate a random permutation of batch indices
+    # perm = torch.randperm(batch_size, generator=generator, device=x.device)
+    perm = torch.randperm(batch_size, generator=generator)  # CPU LongTensor
+    perm = perm.to(x.device)
+
+
+    # Make a copy of x
+    x_swapped = x.clone()
+
+    # Replace selected features with values from other samples in the same batch
+    x_swapped[mask] = x[perm][mask]
+
+    return x_swapped
+
 # ===== AE =====
 
 def decorrelation_loss(latent_repr: torch.Tensor) -> torch.Tensor:
@@ -40,24 +143,20 @@ def decorrelation_loss(latent_repr: torch.Tensor) -> torch.Tensor:
 
 
 class AEModel(nn.Module):
-    def __init__(self, input_dim, latent_dim, h1, h2, h3):
+    def __init__(self, input_dim, latent_dim, h1, h2):
         super(AEModel, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, h1),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
             nn.Linear(h1, h2),
-            nn.LeakyReLU(0.01),
-            nn.Linear(h2, h3),
-            nn.LeakyReLU(0.01),
-            nn.Linear(h3, latent_dim),
+            nn.GELU(),
+            nn.Linear(h2, latent_dim),
         )
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, h3),
-            nn.LeakyReLU(0.01),
-            nn.Linear(h3, h2),
-            nn.LeakyReLU(0.01),
+            nn.Linear(latent_dim, h2),
+            nn.GELU(),
             nn.Linear(h2, h1),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
             nn.Linear(h1, input_dim),
         )
 
@@ -68,39 +167,69 @@ class AEModel(nn.Module):
 
 class AE:
     """
-    简化版示例：Autoencoder 的外层封装
-    __init__(X_train, X_val, encoding_dim, h1, h2, h3)
-    train(max_epochs=..., patience=..., show_plot=...)
-    evaluate_on_data(X) -> (latent, rec_errors, evr, total_evr, recon)
+    Wrapper for the autoencoder.
     """
-    def __init__(self, X_train, X_val, encoding_dim, h1=0, h2=0, h3=0):
+
+    def __init__(
+        self,
+        X_train,
+        X_val,
+        encoding_dim,
+        h1=0,
+        h2=0,
+        *,
+        lr,
+        seed,
+        lambda_decorr: float = 0.0,
+        weight_decay: float = 0.0,
+    ):
         train_ds = QuestionnaireDataset(X_train)
         val_ds = QuestionnaireDataset(X_val)
-        self.train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-        self.val_loader = DataLoader(val_ds, batch_size=32)
+
+        g_loader = torch.Generator().manual_seed(seed)
+        self.train_loader = DataLoader(
+            train_ds, batch_size=32, shuffle=True, generator=g_loader
+        )
+        self.val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
+
+        # decorrelation weight and noise generator
+        self.lambda_decorr = float(lambda_decorr)
+        self.g_noise = torch.Generator().manual_seed(seed + 1)
 
         input_dim = X_train.shape[1]
-        self.model = AEModel(input_dim, encoding_dim, h1, h2, h3).to(device)
+        self.model = AEModel(input_dim, encoding_dim, h1, h2).to(device)
         self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
+        )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.1, patience=5
         )
 
-    def train(self, max_epochs=2000, patience=20, show_plot=False):
+    def train(self, max_epochs=1000, patience=30, show_plot=False):
         best_val_loss = float("inf")
         epochs_no_improve = 0
         train_losses, val_losses = [], []
+
         for epoch in range(max_epochs):
+            # ---------- train ----------
             self.model.train()
-            total_train_loss = 0
+            total_train_loss = 0.0
             for batch_x, _ in self.train_loader:
                 batch_x = batch_x.to(device)
+                x_noisy = batch_swap_noise(
+                    batch_x, swap_prob=0.1, generator=self.g_noise
+                )
                 self.optimizer.zero_grad()
-                reconstructed = self.model(batch_x)
+                reconstructed = self.model(x_noisy)
                 rec_loss = self.criterion(reconstructed, batch_x)
+
                 latent = self.model.encoder(batch_x)
-                dec_loss = decorrelation_loss(latent)
+                if self.lambda_decorr > 0.0:
+                    dec_loss = self.lambda_decorr * decorrelation_loss(latent)
+                else:
+                    dec_loss = 0.0
+
                 loss = rec_loss + dec_loss
                 loss.backward()
                 self.optimizer.step()
@@ -109,25 +238,29 @@ class AE:
             train_avg = total_train_loss / len(self.train_loader.dataset)
             train_losses.append(train_avg)
 
-            # 验证
+            # ---------- val ----------
             self.model.eval()
-            total_val_loss = 0
+            total_val_loss = 0.0
             with torch.no_grad():
                 for batch_x, _ in self.val_loader:
                     batch_x = batch_x.to(device)
                     reconstructed = self.model(batch_x)
                     rec_loss = self.criterion(reconstructed, batch_x)
                     latent = self.model.encoder(batch_x)
-                    dec_loss = decorrelation_loss(latent)
-                    total_val_loss += (rec_loss + dec_loss).item() * batch_x.size(0)
+                    if self.lambda_decorr > 0.0:
+                        dec_loss = self.lambda_decorr * decorrelation_loss(latent)
+                    else:
+                        dec_loss = 0.0
+                    total_val_loss += (rec_loss + dec_loss) * batch_x.size(0)
 
-            val_avg = total_val_loss / len(self.val_loader.dataset)
+            val_avg = total_val_loss.item() / len(self.val_loader.dataset)
             val_losses.append(val_avg)
             self.scheduler.step(val_avg)
 
             if val_avg < best_val_loss:
                 best_val_loss = val_avg
                 epochs_no_improve = 0
+                # If you want to save the best model later, back up state_dict here.
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
@@ -137,8 +270,11 @@ class AE:
         if show_plot:
             plt.plot(train_losses, label="Train Loss")
             plt.plot(val_losses, label="Validation Loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("AE Loss Curves")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("AE Loss Curves")
+            plt.legend()
+            plt.show()
 
     def evaluate_on_data(self, X):
         self.model.eval()
@@ -147,15 +283,14 @@ class AE:
             X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
             recon = self.model(X_t)
             latent = self.model.encoder(X_t).cpu().numpy()
-            latent_vars = np.var(latent, axis=0)
-            total_var = np.var(X_np, axis=0).sum()
+            latent_vars = np.var(latent, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
             evr = latent_vars / total_var
             recon_np = recon.cpu().numpy()
-            rec_errors = np.mean((X_np - recon_np)**2, axis=1)
-            recon_var = np.var(recon_np, axis=0).sum()
-            total_evr = recon_var / total_var
-        return latent, rec_errors, evr, total_evr, recon_np
-
+            rec_errors = np.mean((X_np - recon_np) ** 2, axis=1)
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
+            total_r2 = _total_r2_from_recon(X_np, recon_np)
+        return latent, rec_errors, evr, total_evr, recon_np, total_r2
 
 # ===== SparseAE =====
 
@@ -279,13 +414,12 @@ class SparseAE:
             X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
             recon = self.model(X_t)
             latent = self.model.encoder(X_t).cpu().numpy()
-            latent_vars = np.var(latent, axis=0)
-            total_var = np.var(X_np, axis=0).sum()
+            latent_vars = np.var(latent, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
             evr = latent_vars / total_var
             recon_np = recon.cpu().numpy()
             rec_errors = np.mean((X_np - recon_np)**2, axis=1)
-            recon_var = np.var(recon_np, axis=0).sum()
-            total_evr = 1 - np.var((X_t - recon).cpu().numpy(), axis=0).sum() / total_var
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
         return latent, rec_errors, evr, total_evr, recon_np
 
     def export_to_onnx(self, X_train, onnx_path):
@@ -468,38 +602,26 @@ class COAE:
         
     def evaluate_on_data(self, X):
         """
-        对输入 X 做前向，返回 (latent, rec_errors, evr, total_evr, recon)：
-        - latent: (n_samples, latent_dim)
-        - rec_errors: 每个样本的重构 MSE，形状 (n_samples,)
-        - evr: 每个潜变量在重构中解释的方差比例，形状 (latent_dim,)
-        - total_evr: 重构数据方差 / 输入总方差，标量
-        - recon: 重构后的数据，形状 (n_samples, input_dim)
+        对输入 X 做前向，返回 (latent, rec_errors, evr, total_evr, recon)。
         """
         self.model.eval()
         with torch.no_grad():
-            # 1) 编码得到 z
-            X_t = torch.tensor(X, dtype=torch.float32, device=device)
-            z = self.model.encode(X_t)               # Tensor (n_samples, latent_dim)
+            X_np = np.asarray(X)
+            X_t = torch.tensor(X_np, dtype=torch.float32, device=device)
+            z = self.model.encode(X_t)
             z_np = z.cpu().numpy()
 
-            # 2) 计算每个潜变量的方差并归一化
-            latent_vars = np.var(z_np, axis=0)          # (latent_dim,)
-            total_var = np.var(X, axis=0).sum()      # 输入空间总方差
-            evr = latent_vars / total_var               # (latent_dim,)
+            latent_vars = np.var(z_np, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
+            evr = latent_vars / total_var
 
-            # 3) 解码得到重构 x_hat
-            x_hat = self.model.decode(z)                # Tensor (n_samples, input_dim)
+            x_hat = self.model.decode(z)
             recon_np = x_hat.cpu().numpy()
 
-            # 4) 每个样本的重构误差（MSE）
-            rec_errors = np.mean((X - recon_np) ** 2, axis=1)  # (n_samples,)
-
-            # 5) 计算重构的方差并归一化，得到 total_evr
-            recon_var = np.var(recon_np, axis=0).sum()  # 重构数据各维度方差之和
-            total_evr = recon_var / total_var           # 标量
+            rec_errors = np.mean((X_np - recon_np) ** 2, axis=1)
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
 
         return z_np, rec_errors, evr, total_evr, recon_np
-
 
 
 # ===== VAE =====
@@ -618,13 +740,12 @@ class VAE:
             X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
             recon, mu, logvar = self.model(X_t)
             latent = mu.cpu().numpy()
-            latent_vars = np.var(latent, axis=0)
-            total_var = np.var(X_np, axis=0).sum()
+            latent_vars = np.var(latent, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
             evr = latent_vars / total_var
             recon_np = recon.cpu().numpy()
             rec_errors = np.mean((X_np - recon_np)**2, axis=1)
-            recon_var = np.var(recon_np, axis=0).sum()
-            total_evr = 1 - np.var((X_t - recon).cpu().numpy(), axis=0).sum() / total_var
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
         return latent, rec_errors, evr, total_evr, recon_np
 
 
@@ -771,13 +892,12 @@ class BetaVAE:
             X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
             recon, _, _ = self.model(X_t)
             z = self.model.get_latent(X_t).cpu().numpy()
-            latent_vars = np.var(z, axis=0)
-            total_var = np.var(X_np, axis=0).sum()
+            latent_vars = np.var(z, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
             evr = latent_vars / total_var
             recon_np = recon.cpu().numpy()
             rec_errors = np.mean((X_np - recon_np)**2, axis=1)
-            recon_var = np.var(recon_np, axis=0).sum()
-            total_evr = 1 - np.var((X_t - recon).cpu().numpy(), axis=0).sum() / total_var
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
         return z, rec_errors, evr, total_evr, recon_np
 
 
@@ -798,9 +918,9 @@ class Encoder(nn.Module):
         self.z_dim = z_dim
 
     def forward(self, x):
-        stats = self.net(x)
-        mu = stats[:, : self.z_dim]
-        logvar = stats[:, self.z_dim :]
+        stats_ = self.net(x)
+        mu = stats_[:, : self.z_dim]
+        logvar = stats_[:, self.z_dim :]
         return mu, logvar
 
 
@@ -855,8 +975,6 @@ class FactorVAEModel(nn.Module):
         return x_recon, mu, logvar, z
 
 
-# … 省略其他代码 …
-
 class FactorVAETrainer:
     def __init__(self, model: FactorVAEModel, discriminator: Discriminator,
                  lr_vae=1e-3, lr_d=1e-3, beta_max=0.1, warmup_epochs=10, device=None, verbose=True):
@@ -871,7 +989,7 @@ class FactorVAETrainer:
         self.discriminator.to(self.device)
         self.history = {"recon": [], "kl": [], "tc": [], "d": [], "vae_total": [], "beta": []}
         self.val_loader = None  # 由外部赋值
-        self.verbose = verbose  # 新增：是否在训练过程中打印 epoch 信息
+        self.verbose = verbose
 
     def _permute_latent(self, z: torch.Tensor) -> torch.Tensor:
         B, D = z.size()
@@ -887,7 +1005,7 @@ class FactorVAETrainer:
             epoch_recon = epoch_kl = epoch_tc = epoch_d = epoch_vae = 0.0
             n_batches = 0
 
-            # —————— 训练阶段 ——————
+            # 训练阶段
             for batch in data_loader:
                 n_batches += 1
                 x = batch[0].to(self.device)
@@ -931,7 +1049,7 @@ class FactorVAETrainer:
                 loss_vae.backward()
                 self.optim_vae.step()
 
-            # 汇总当轮平均 loss
+            # 汇总
             self.history["recon"].append(epoch_recon / n_batches)
             self.history["kl"].append(epoch_kl / n_batches)
             self.history["tc"].append(epoch_tc / n_batches)
@@ -939,7 +1057,6 @@ class FactorVAETrainer:
             self.history["vae_total"].append(epoch_vae / n_batches)
             self.history["beta"].append(beta)
 
-            # —————— 打印 epoch 信息（加 if self.verbose） ——————
             if self.verbose:
                 print(
                     f"Epoch {epoch}, Recon: {epoch_recon/n_batches:.4f}, "
@@ -947,7 +1064,6 @@ class FactorVAETrainer:
                     f"D: {epoch_d/n_batches:.4f}"
                 )
 
-        # 最后画图（如果需要）
         if self.verbose:
             plt.figure(figsize=(8, 5))
             plt.plot(self.history["recon"], label="Reconstruction")
@@ -962,7 +1078,6 @@ class FactorVAETrainer:
             plt.plot(self.history["beta"], label="Beta")
             plt.xlabel("Epoch"); plt.ylabel("Beta Value"); plt.title("Beta Warm-up Schedule")
             plt.legend(); plt.show()
-
 
     def plot_history(self):
         plt.figure(figsize=(8, 5))
@@ -986,13 +1101,12 @@ class FactorVAETrainer:
         with torch.no_grad():
             recon, mu, logvar, z = self.model(X_t)
             z_np = z.cpu().numpy()
-            latent_vars = np.var(z_np, axis=0)
-            total_var = np.var(X_np, axis=0).sum()
+            latent_vars = np.var(z_np, axis=0, ddof=1)
+            total_var = np.var(X_np, axis=0, ddof=1).sum()
             evr = latent_vars / total_var
             recon_np = recon.cpu().numpy()
             rec_errors = np.mean((X_np - recon_np)**2, axis=1)
-            recon_var = np.var(recon_np, axis=0).sum()
-            total_evr = recon_var / total_var
+            total_evr = _total_evr_from_recon(X_np, recon_np, ddof=1)
         return z_np, rec_errors, evr, total_evr, recon_np
 
 

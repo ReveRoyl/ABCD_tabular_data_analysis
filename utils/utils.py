@@ -10,10 +10,14 @@ from deep_translator import GoogleTranslator
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 import textwrap
+import torch
+import torch.nn as nn
+import shap
 # --------------------------------------------------------------------------------------------------
 
 def get_cbcl_details(cbcl_item):
@@ -319,3 +323,159 @@ def compute_autoencoder_loadings_with_plot(latent_factors, X_train, items, top_k
         plt.show()
 
     return loadings_df
+
+class DecoderHead(nn.Module):
+    def __init__(self, decoder: nn.Module, out_idx: int = 0):
+        super().__init__()
+        self.decoder = decoder
+        self.out_idx = out_idx
+    def forward(self, z):
+        xhat = self.decoder(z)                       # (batch, n_items)
+        return xhat[:, self.out_idx:self.out_idx+1]  # (batch, 1) 单输出更稳
+
+def compute_shap_loadings_decoder_only(
+    decoder: nn.Module,
+    Z,                       # (n_samples, n_latent) numpy / torch / pandas
+    items,                   # 题项名，len == n_items
+    device="cuda",
+    background_size=32,
+    sample_size=200,
+    nsamples=16,             # 显式缩小 nsamples（默认~100-200很慢）
+    eval_batch=128,          # 对 Z_eval 分批
+    top_k=8,
+    plot=True,
+    freeze_decoder=True,
+    seed=6,
+):
+    # ---- 设备与模型 ----
+    use_cuda = (device == "cuda") and torch.cuda.is_available()
+    dev = torch.device("cuda" if use_cuda else "cpu")
+    dec = decoder.eval().to(dev)
+    if freeze_decoder:
+        for p in dec.parameters():
+            p.requires_grad_(False)
+
+    # ---- 准备输入数据 ----
+    if isinstance(Z, torch.Tensor):
+        Z_np = Z.detach().cpu().numpy()
+    elif isinstance(Z, pd.DataFrame):
+        Z_np = Z.values
+    else:
+        Z_np = np.asarray(Z)
+    assert Z_np.ndim == 2, f"Z must be 2D, got shape {Z_np.shape}"
+    n_all, n_latent = Z_np.shape
+
+    rng = np.random.default_rng(seed)
+    bg_idx = rng.choice(n_all, size=min(background_size, n_all), replace=False)
+    ev_idx = rng.choice(n_all, size=min(sample_size,   n_all), replace=False)
+
+    Z_bg   = torch.from_numpy(Z_np[bg_idx]).to(dev, dtype=torch.float32)
+    Z_eval = torch.from_numpy(Z_np[ev_idx]).to(dev, dtype=torch.float32)
+
+    # 输出维度（题项数）
+    with torch.no_grad():
+        n_items = dec(Z_eval[:1]).shape[1]
+    item_index = list(items)
+    if len(item_index) != n_items:
+        # 保底：长度不一致时生成占位名以避免报错
+        item_index = [str(s) for s in item_index[:n_items]] + \
+                     [f"item_{i}" for i in range(len(item_index), n_items)]
+
+    # ---- 复用一个 head + explainer ----
+    head = DecoderHead(dec, out_idx=0).eval().to(dev)
+    explainer = shap.GradientExplainer(head, Z_bg)
+
+    load_signed = np.zeros((n_items, n_latent), dtype=np.float32)
+    # 假设已得到 R 返回的旋转矩阵/载荷
+
+
+    strength    = np.zeros((n_items, n_latent), dtype=np.float32)
+
+    # ---- 逐题项，但不重复创建 explainer；对 Z_eval 分批 ----
+    for i in range(n_items):
+        head.out_idx = i
+        parts = []
+        for chunk in torch.split(Z_eval, eval_batch):
+            sv = explainer.shap_values(chunk, nsamples=nsamples)
+            # 统一形状为 (m_eval, n_latent)
+            if isinstance(sv, list):
+                sv = sv[0]
+            sv = np.asarray(sv)
+            if sv.ndim == 3:
+                if sv.shape[-1] == 1:      # (m_eval, n_latent, 1)
+                    sv = sv[..., 0]
+                elif sv.shape[0] == 1:     # (1, m_eval, n_latent)
+                    sv = sv[0]
+                elif sv.shape[1] == 1:     # (m_eval, 1, n_latent)
+                    sv = sv[:, 0, :]
+                else:                      # 多输出，取第一个
+                    sv = sv[..., 0]
+            elif sv.ndim == 1:
+                sv = sv[None, :]
+            parts.append(sv)
+        sv = np.concatenate(parts, axis=0)        # (m_eval, n_latent)
+        load_signed[i, :] = sv.mean(axis=0)       # 带符号平均
+        strength[i,   :] = np.abs(sv).mean(axis=0)# 强度平均
+
+    # ---- 构造 DataFrame（先构造再绘图，避免 NameError）----
+    cols = [f"Latent_{j+1}" for j in range(n_latent)]
+    load_signed_df = pd.DataFrame(load_signed, index=item_index, columns=cols)
+    strength_df    = pd.DataFrame(strength,    index=item_index, columns=cols)
+
+    # ---- 可视化（按强度挑 top-k）----
+    if plot:
+        for col in cols:
+            k = min(top_k, len(item_index))
+            top_idx = strength_df[col].nlargest(k).index
+            mat = load_signed_df.loc[top_idx, [col]].sort_values(col, key=np.abs, ascending=False)
+
+            plt.figure(figsize=(6, 0.45 * len(top_idx)))
+            # 也可以用条形图，这里保留你原本的 heatmap 风格
+            plt.imshow(
+                mat.values, aspect="auto", interpolation="nearest",
+                cmap="coolwarm",
+                vmin=-np.max(np.abs(mat.values)),
+                vmax=np.max(np.abs(mat.values)),
+            )
+            plt.colorbar(label="mean SHAP (signed)")
+            plt.yticks(range(len(top_idx)), top_idx)
+            plt.xticks([0], [col])
+            plt.title(f"Top {len(top_idx)} SHAP-based Loadings for {col}")
+            plt.tight_layout()
+            plt.show()
+
+    return load_signed_df, strength_df
+
+def check_reconstruction(X_test, reconstructed, qns, vals=(0.0, 0.5, 1.0), atol=1e-8):
+    """
+    Check the average reconstructed values for given discrete inputs.
+
+    Parameters
+    ----------
+    X_test : np.ndarray
+        Original test data of shape (n_samples, n_features).
+    reconstructed : np.ndarray
+        Reconstructed data of shape (n_samples, n_features).
+    qns : pd.DataFrame
+        Questionnaire DataFrame (assumes first column is ID, features start from column index 1).
+    vals : tuple
+        Values to check, e.g. (0.0, 0.5, 1.0).
+    atol : float
+        Tolerance for value matching in np.isclose.
+
+    Returns
+    -------
+    results : list of tuples
+        Each tuple is (column_name, value, mean_reconstruction, count).
+    """
+    results = []
+    for j in range(X_test.shape[1]):
+        colname = qns.columns[j+1]  # offset by 1 if qns has ID column
+        for v in vals:
+            mask = np.isclose(X_test[:, j], v, atol=atol)
+            if mask.any():
+                m = reconstructed[mask, j].mean()
+                n = mask.sum()
+                print(f"{colname}: {v} -> {m:.3f} (n={n})")
+                results.append((colname, v, m, n))
+    return results
