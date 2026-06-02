@@ -1,32 +1,50 @@
-# model.py
+"""Neural network models for questionnaire representation learning.
 
+This module defines dataset utilities, reproducibility helpers, reconstruction
+metrics, and PyTorch implementations of AE, SparseAE, COAE, VAE, BetaVAE, and
+FactorVAE models used for low-dimensional latent representation analysis.
+"""
+
+# Imports
 import os
+import random
+from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
+import scipy.stats as stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-import scipy.stats as stats
-import random
+from torch.utils.data import DataLoader, Dataset
 
+
+# Configuration and runtime settings
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-# 先给个默认值，后面在 set_deterministic 里会用 global 覆盖
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def set_deterministic(seed: int):
-    """
-    全局随机种子固定 + 强制确定性算法（确保每次结果完全一样）
-    注意：需要在主脚本最开始设置好环境变量后调用。
-    """
-    global device  # 关键：同时更新本模块里的全局 device
+# Utility functions
 
-    # 固定 Python、NumPy、Torch 随机性
+def set_deterministic(seed: int) -> torch.device:
+    """Set random seeds and deterministic PyTorch settings.
+
+    Parameters
+    ----------
+    seed : int
+        Random seed applied to Python, NumPy, and PyTorch.
+
+    Returns
+    -------
+    torch.device
+        Runtime device selected by PyTorch.
+    """
+    global device
+
+    # Fix Python, NumPy, and PyTorch random states.
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -34,19 +52,19 @@ def set_deterministic(seed: int):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # 确保 cuDNN / matmul 确定性
+    # Disable nondeterministic CUDA/cuDNN behavior where available.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-    # PyTorch ≥ 1.9: 强制启用确定性算法
+    # Request deterministic kernels when the installed PyTorch version supports it.
     try:
         torch.use_deterministic_algorithms(True)
     except Exception as e:
         print(f"Warning: deterministic_algorithms not fully supported: {e}")
 
-    # 自动选择设备，并更新本模块的全局 device
+    # Refresh the module-level device after seed and backend setup.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[Seed fixed] random/numpy/torch all set to {seed}")
@@ -55,22 +73,33 @@ def set_deterministic(seed: int):
     return device
 
 
-def is_nni_running():
+def is_nni_running() -> bool:
+    """Return whether the current process is running under NNI."""
     return "NNI_PLATFORM" in os.environ
 
 
 class QuestionnaireDataset(Dataset):
+    """PyTorch dataset returning questionnaire vectors as both input and target.
+
+    Parameters
+    ----------
+    data : array-like
+        Numeric questionnaire matrix with shape ``(n_samples, n_features)``.
+    """
+
     def __init__(self, data):
         self.data = torch.tensor(data, dtype=torch.float32)
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples."""
         return len(self.data)
 
     def __getitem__(self, idx):
+        """Return one sample as an autoencoder input-target pair."""
         return self.data[idx], self.data[idx]
 
 
-# ======== 统一的 total_evr 计算工具函数（残差方差法，样本方差 ddof=1） ========
+# Evaluation functions
 
 def _total_evr_from_recon(X_np: np.ndarray, recon_np: np.ndarray, ddof: int = 1) -> float:
     """
@@ -94,46 +123,53 @@ def _total_evr_from_recon(X_np: np.ndarray, recon_np: np.ndarray, ddof: int = 1)
 # R2 = 1 - SSE/SST, as columns
 # -------------------------
 def _total_r2_from_recon(X_np: np.ndarray, recon_np: np.ndarray) -> float:
+    """Compute reconstruction R² using total SSE and SST across all features."""
     Xc = X_np - X_np.mean(axis=0, keepdims=True)
     sse = np.sum((X_np - recon_np) ** 2)
     sst = np.sum(Xc ** 2)
     return float(1.0 - sse / sst) if sst > 0 else np.nan
 
-def batch_swap_noise(x, swap_prob=0.15, generator=None):
+def batch_swap_noise(
+    x: torch.Tensor,
+    swap_prob: float = 0.15,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Apply feature-level swap noise within a mini-batch.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input batch with shape ``(batch_size, input_dim)``.
+    swap_prob : float, default=0.15
+        Probability that each feature value is replaced by the same feature from
+        another sample in the mini-batch.
+    generator : torch.Generator, optional
+        Random generator used for deterministic batch corruption.
+
+    Returns
+    -------
+    torch.Tensor
+        Noisy batch with the same shape as ``x``.
     """
-    Add batch swap noise to the input batch.
-    Args:
-        x: Tensor of shape [batch_size, input_dim]
-        swap_prob: Probability (0 - 1) that each feature will be swapped.
-    Returns:
-        x_noisy: Tensor with added noise.
-    """
-    batch_size, input_dim = x.shape
+    batch_size, _ = x.shape
 
     if generator is None:
-        generator = torch.default_generator  # fallback to global
+        generator = torch.default_generator
 
-    # Randomly generate a mask
-    # mask = torch.rand_like(x, generator=generator) < swap_prob  # True indicates features to be swapped
-    rand_cpu = torch.rand(x.shape, generator=generator)  # CPU tensor
-    mask = (rand_cpu < swap_prob).to(x.device)
-    # Generate a random permutation of batch indices
-    # perm = torch.randperm(batch_size, generator=generator, device=x.device)
-    perm = torch.randperm(batch_size, generator=generator)  # CPU LongTensor
-    perm = perm.to(x.device)
+    # Generate the swap mask and row permutation on CPU for broad PyTorch compatibility.
+    mask = (torch.rand(x.shape, generator=generator) < swap_prob).to(x.device)
+    perm = torch.randperm(batch_size, generator=generator).to(x.device)
 
-
-    # Make a copy of x
     x_swapped = x.clone()
-
-    # Replace selected features with values from other samples in the same batch
     x_swapped[mask] = x[perm][mask]
-
     return x_swapped
 
-# ===== AE =====
+
+# Model and analysis functions
+# AE
 
 def decorrelation_loss(latent_repr: torch.Tensor) -> torch.Tensor:
+    """Penalize off-diagonal covariance in a latent representation."""
     batch_size, latent_dim = latent_repr.shape
     centered = latent_repr - latent_repr.mean(dim=0, keepdim=True)
     cov = (centered.T @ centered) / batch_size
@@ -143,7 +179,9 @@ def decorrelation_loss(latent_repr: torch.Tensor) -> torch.Tensor:
 
 
 class AEModel(nn.Module):
-    def __init__(self, input_dim, latent_dim, h1, h2):
+    """Feedforward autoencoder with GELU activations."""
+
+    def __init__(self, input_dim: int, latent_dim: int, h1: int, h2: int):
         super(AEModel, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, h1),
@@ -160,15 +198,14 @@ class AEModel(nn.Module):
             nn.Linear(h1, input_dim),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode and reconstruct an input batch."""
         z = self.encoder(x)
         return self.decoder(z)
 
 
 class AE:
-    """
-    Wrapper for the autoencoder.
-    """
+    """Training and evaluation wrapper for the denoising autoencoder."""
 
     def __init__(
         self,
@@ -207,12 +244,13 @@ class AE:
         )
 
     def train(self, max_epochs=1000, patience=30, show_plot=False):
+        """Train the autoencoder with swap noise and early stopping."""
         best_val_loss = float("inf")
         epochs_no_improve = 0
         train_losses, val_losses = [], []
 
         for epoch in range(max_epochs):
-            # ---------- train ----------
+            # Training phase: optimize reconstruction and optional latent decorrelation.
             self.model.train()
             total_train_loss = 0.0
             for batch_x, _ in self.train_loader:
@@ -238,7 +276,7 @@ class AE:
             train_avg = total_train_loss / len(self.train_loader.dataset)
             train_losses.append(train_avg)
 
-            # ---------- val ----------
+            # Validation phase: monitor held-out reconstruction objective.
             self.model.eval()
             total_val_loss = 0.0
             with torch.no_grad():
@@ -251,16 +289,15 @@ class AE:
                         dec_loss = self.lambda_decorr * decorrelation_loss(latent)
                     else:
                         dec_loss = 0.0
-                    total_val_loss += (rec_loss + dec_loss) * batch_x.size(0)
+                    total_val_loss += (rec_loss + dec_loss).item() * batch_x.size(0)
 
-            val_avg = total_val_loss.item() / len(self.val_loader.dataset)
+            val_avg = total_val_loss / len(self.val_loader.dataset)
             val_losses.append(val_avg)
             self.scheduler.step(val_avg)
 
             if val_avg < best_val_loss:
                 best_val_loss = val_avg
                 epochs_no_improve = 0
-                # If you want to save the best model later, back up state_dict here.
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
@@ -277,6 +314,7 @@ class AE:
             plt.show()
 
     def evaluate_on_data(self, X):
+        """Return latent scores, reconstruction errors, EVR metrics, reconstruction, and R²."""
         self.model.eval()
         X_np = np.asarray(X)
         with torch.no_grad():
@@ -292,9 +330,11 @@ class AE:
             total_r2 = _total_r2_from_recon(X_np, recon_np)
         return latent, rec_errors, evr, total_evr, recon_np, total_r2
 
-# ===== SparseAE =====
+# SparseAE
 
 class SparseAEModel(nn.Module):
+    """Autoencoder model with KL-based sparsity regularization."""
+
     def __init__(self, input_dim, latent_dim, h1, h2, h3, sparsity_target=0.05, beta=1.0):
         super(SparseAEModel, self).__init__()
         self.sparsity_target = sparsity_target
@@ -332,12 +372,7 @@ class SparseAEModel(nn.Module):
 
 
 class SparseAE:
-    """
-    Sparse autoencoder封装
-    __init__(X_train, X_val, encoding_dim, h1, h2, h3, sparsity_target, beta)
-    train(max_epochs=..., patience=..., show_plot=...)
-    evaluate_on_data(X) -> (latent, rec_errors, evr, total_evr, recon_np)
-    """
+    """Training and evaluation wrapper for the sparse autoencoder."""
     def __init__(self, X_train, X_val, encoding_dim, h1=0, h2=0, h3=0, sparsity_target=0.05, beta=1.0):
         train_ds = QuestionnaireDataset(X_train)
         val_ds = QuestionnaireDataset(X_val)
@@ -353,6 +388,7 @@ class SparseAE:
         )
 
     def train(self, max_epochs=2000, patience=20, show_plot=False):
+        """Train the sparse autoencoder with KL sparsity penalty and early stopping."""
         best_val = float("inf")
         epochs_no_improve = 0
         train_hist, val_hist = [], []
@@ -404,10 +440,14 @@ class SparseAE:
         if show_plot:
             plt.plot(train_hist, label="Train Loss")
             plt.plot(val_hist, label="Validation Loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("SparseAE Loss Curves")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("SparseAE Loss Curves")
+            plt.legend()
+            plt.show()
 
     def evaluate_on_data(self, X):
+        """Return latent scores, reconstruction errors, EVR metrics, and reconstruction."""
         self.model.eval()
         X_np = np.asarray(X)
         with torch.no_grad():
@@ -423,6 +463,7 @@ class SparseAE:
         return latent, rec_errors, evr, total_evr, recon_np
 
     def export_to_onnx(self, X_train, onnx_path):
+        """Export the sparse autoencoder model to ONNX format."""
         dummy_input = torch.tensor(X_train[:1], dtype=torch.float32).to(device)
         torch.onnx.export(
             self.model,
@@ -436,9 +477,11 @@ class SparseAE:
         print(f"Model exported to {onnx_path}")
 
 
-# ===== COAE =====
+# COAE
 
 class ClusteringLayer(nn.Module):
+    """Soft assignment layer based on learnable cluster centers."""
+
     def __init__(self, n_clusters, latent_dim):
         super(ClusteringLayer, self).__init__()
         self.cluster_centers = nn.Parameter(torch.randn(n_clusters, latent_dim))
@@ -449,6 +492,7 @@ class ClusteringLayer(nn.Module):
 
 
 def orthogonality_loss(z: torch.Tensor) -> torch.Tensor:
+    """Penalize deviation of latent covariance from the identity matrix."""
     z_centered = z - z.mean(dim=0, keepdim=True)
     cov = (z_centered.T @ z_centered) / z.size(0)
     I = torch.eye(z.size(1), device=z.device)
@@ -456,6 +500,7 @@ def orthogonality_loss(z: torch.Tensor) -> torch.Tensor:
 
 
 def sparsity_kl_divergence(rho: float, rho_hat: torch.Tensor) -> torch.Tensor:
+    """Compute KL sparsity penalty between a target activation and observed activation."""
     rho_hat = torch.clamp(rho_hat, 1e-10, 1 - 1e-10)
     return torch.sum(
         rho * torch.log(rho / rho_hat)
@@ -464,11 +509,14 @@ def sparsity_kl_divergence(rho: float, rho_hat: torch.Tensor) -> torch.Tensor:
 
 
 def compute_target_distribution(p: torch.Tensor) -> torch.Tensor:
+    """Compute the sharpened target distribution used by clustering loss."""
     weight = (p ** 2) / torch.sum(p, dim=0)
     return (weight.t() / torch.sum(weight, dim=1)).t()
 
 
 class COAEModel(nn.Module):
+    """Clustering-oriented autoencoder with tied decoder weights."""
+
     def __init__(self, input_dim, latent_dim, h1, h2, h3, n_clusters):
         super(COAEModel, self).__init__()
         self.encoder = nn.Sequential(
@@ -505,11 +553,7 @@ class COAEModel(nn.Module):
 
 
 class COAE:
-    """
-    X_train: numpy array, X_val: numpy array,
-    latent_dim, h1, h2, h3, n_clusters,
-    lambda_orth, mu_clust, lambda_sparsity, sparsity_target
-    """
+    """Training and evaluation wrapper for the clustering-oriented autoencoder."""
     def __init__(self, X_train, X_val, latent_dim, h1, h2, h3, n_clusters,
                  lambda_orth=1e-1, mu_clust=1.0, lambda_sparsity=1e-4, sparsity_target=0.8):
         train_ds = QuestionnaireDataset(X_train)
@@ -530,6 +574,7 @@ class COAE:
         self.sparsity_target = sparsity_target
 
     def train(self, max_epochs=200, patience=50, show_plot=False):
+        """Train COAE using reconstruction, orthogonality, clustering, and sparsity terms."""
         best_val = float("inf")
         epochs_no_improve = 0
         train_losses, val_losses = [], []
@@ -597,13 +642,14 @@ class COAE:
         if show_plot:
             plt.plot(train_losses, label="Train Loss")
             plt.plot(val_losses, label="Validation Loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("COAE Loss Curves")
-            plt.legend(); plt.show()
-        
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("COAE Loss Curves")
+            plt.legend()
+            plt.show()
+
     def evaluate_on_data(self, X):
-        """
-        对输入 X 做前向，返回 (latent, rec_errors, evr, total_evr, recon)。
-        """
+        """Return latent scores, reconstruction errors, EVR metrics, and reconstruction."""
         self.model.eval()
         with torch.no_grad():
             X_np = np.asarray(X)
@@ -624,9 +670,11 @@ class COAE:
         return z_np, rec_errors, evr, total_evr, recon_np
 
 
-# ===== VAE =====
+# VAE
 
 class VAEModel(nn.Module):
+    """Variational autoencoder model with Gaussian latent variables."""
+
     def __init__(self, input_dim, latent_dim, h1, h2, h3):
         super(VAEModel, self).__init__()
         self.encoder_net = nn.Sequential(
@@ -667,6 +715,8 @@ class VAEModel(nn.Module):
 
 
 class VAE:
+    """Training and evaluation wrapper for the variational autoencoder."""
+
     def __init__(self, X_train, X_val, encoding_dim, h1=0, h2=0, h3=0, beta_kl=1.0):
         train_ds = QuestionnaireDataset(X_train)
         val_ds = QuestionnaireDataset(X_val)
@@ -683,6 +733,7 @@ class VAE:
         self.beta_kl = beta_kl
 
     def train(self, max_epochs=2000, patience=20, show_plot=False):
+        """Train the VAE with reconstruction and KL-divergence losses."""
         best_val = float("inf")
         wait = 0
         train_hist, val_hist = [], []
@@ -730,8 +781,11 @@ class VAE:
         if show_plot:
             plt.plot(train_hist, label="Train Loss")
             plt.plot(val_hist, label="Validation Loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("VAE Loss Curves")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("VAE Loss Curves")
+            plt.legend()
+            plt.show()
 
     def evaluate_on_data(self, X):
         self.model.eval()
@@ -749,9 +803,11 @@ class VAE:
         return latent, rec_errors, evr, total_evr, recon_np
 
 
-# ===== BetaVAE =====
+# BetaVAE
 
 class BetaVAEModel(nn.Module):
+    """Beta-VAE model with an annealed KL contribution during training."""
+
     def __init__(self, input_dim, latent_dim, h1, h2, h3):
         super(BetaVAEModel, self).__init__()
         self.encoder_net = nn.Sequential(
@@ -797,6 +853,8 @@ class BetaVAEModel(nn.Module):
 
 
 class BetaVAE:
+    """Training and evaluation wrapper for Beta-VAE."""
+
     def __init__(self, X_train, X_val, encoding_dim, h1=0, h2=0, h3=0):
         train_ds = QuestionnaireDataset(X_train)
         val_ds = QuestionnaireDataset(X_val)
@@ -811,9 +869,16 @@ class BetaVAE:
             self.optimizer, mode="min", factor=0.1, patience=5
         )
 
-    def train(self, max_epochs=2000, patience=20,
-              beta_max=0.5, kl_anneal_epochs=200, recon_weight=100,
-              show_plot=False):
+    def train(
+        self,
+        max_epochs=2000,
+        patience=20,
+        beta_max=0.5,
+        kl_anneal_epochs=200,
+        recon_weight=100,
+        show_plot=False,
+    ):
+        """Train Beta-VAE with KL annealing and latent distribution diagnostics."""
         best_val = float("inf")
         epochs_no_improve = 0
         train_losses, val_losses = [], []
@@ -871,10 +936,13 @@ class BetaVAE:
                 plt.figure(figsize=(8, 4))
                 plt.hist(z.flatten(), bins=50, density=True, alpha=0.6)
                 plt.title(f"Latent Histogram at Epoch {epoch}")
-                plt.xlabel("z"); plt.ylabel("Density"); plt.show()
+                plt.xlabel("z")
+                plt.ylabel("Density")
+                plt.show()
                 plt.figure(figsize=(6, 6))
                 stats.probplot(z.flatten(), dist="norm", plot=plt)
-                plt.title(f"Q-Q Plot at Epoch {epoch}"); plt.show()
+                plt.title(f"Q-Q Plot at Epoch {epoch}")
+                plt.show()
                 shapiro_test = stats.shapiro(z.flatten())
                 print(f"Epoch {epoch}: Shapiro-Wilk p-value = {shapiro_test.pvalue:.5f}")
                 print(f"Epoch {epoch}: Latent mean = {z.mean():.4f}, std = {z.std():.4f}")
@@ -882,8 +950,11 @@ class BetaVAE:
         if show_plot:
             plt.plot(train_losses, label="Train Loss")
             plt.plot(val_losses, label="Validation Loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("BetaVAE Loss Curves")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("BetaVAE Loss Curves")
+            plt.legend()
+            plt.show()
 
     def evaluate_on_data(self, X):
         self.model.eval()
@@ -901,9 +972,11 @@ class BetaVAE:
         return z, rec_errors, evr, total_evr, recon_np
 
 
-# ===== FactorVAE =====
+# FactorVAE
 
 class Encoder(nn.Module):
+    """Encoder network that returns latent mean and log-variance."""
+
     def __init__(self, input_dim, hidden_dims, z_dim, dropout_rate=0.0):
         super(Encoder, self).__init__()
         layers = []
@@ -913,7 +986,7 @@ class Encoder(nn.Module):
             layers.append(nn.LeakyReLU(0.01))
             layers.append(nn.Dropout(dropout_rate))
             prev = h
-        layers.append(nn.Linear(prev, 2 * z_dim))  # 输出 mu 和 logvar
+        layers.append(nn.Linear(prev, 2 * z_dim))
         self.net = nn.Sequential(*layers)
         self.z_dim = z_dim
 
@@ -925,6 +998,8 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Decoder network mapping latent variables back to questionnaire features."""
+
     def __init__(self, z_dim, hidden_dims, output_dim, dropout_rate=0.0):
         super(Decoder, self).__init__()
         layers = []
@@ -942,6 +1017,8 @@ class Decoder(nn.Module):
 
 
 class Discriminator(nn.Module):
+    """Discriminator used to estimate total-correlation structure in FactorVAE."""
+
     def __init__(self, z_dim, hidden_dims=[200, 200]):
         super(Discriminator, self).__init__()
         layers = []
@@ -950,7 +1027,7 @@ class Discriminator(nn.Module):
             layers.append(nn.Linear(prev, h))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             prev = h
-        layers.append(nn.Linear(prev, 2))  # 两个 logit：Joint vs. Permuted
+        layers.append(nn.Linear(prev, 2))
         self.net = nn.Sequential(*layers)
 
     def forward(self, z):
@@ -958,6 +1035,8 @@ class Discriminator(nn.Module):
 
 
 class FactorVAEModel(nn.Module):
+    """FactorVAE model combining an encoder, decoder, and reparameterization step."""
+
     def __init__(self, encoder: Encoder, decoder: Decoder):
         super(FactorVAEModel, self).__init__()
         self.encoder = encoder
@@ -976,8 +1055,19 @@ class FactorVAEModel(nn.Module):
 
 
 class FactorVAETrainer:
-    def __init__(self, model: FactorVAEModel, discriminator: Discriminator,
-                 lr_vae=1e-3, lr_d=1e-3, beta_max=0.1, warmup_epochs=10, device=None, verbose=True):
+    """Trainer for FactorVAE with alternating VAE and discriminator updates."""
+
+    def __init__(
+        self,
+        model: FactorVAEModel,
+        discriminator: Discriminator,
+        lr_vae=1e-3,
+        lr_d=1e-3,
+        beta_max=0.1,
+        warmup_epochs=10,
+        device=None,
+        verbose=True,
+    ):
         self.model = model
         self.discriminator = discriminator
         self.optim_vae = optim.Adam(self.model.parameters(), lr=lr_vae)
@@ -988,7 +1078,7 @@ class FactorVAETrainer:
         self.model.to(self.device)
         self.discriminator.to(self.device)
         self.history = {"recon": [], "kl": [], "tc": [], "d": [], "vae_total": [], "beta": []}
-        self.val_loader = None  # 由外部赋值
+        self.val_loader = None
         self.verbose = verbose
 
     def _permute_latent(self, z: torch.Tensor) -> torch.Tensor:
@@ -1000,17 +1090,18 @@ class FactorVAETrainer:
         return torch.stack(z_perm, dim=1)
 
     def train(self, data_loader, num_epochs):
+        """Train FactorVAE with alternating discriminator and VAE optimization."""
         for epoch in range(1, num_epochs + 1):
             beta = self.beta_max * min(epoch / self.warmup_epochs, 1.0)
             epoch_recon = epoch_kl = epoch_tc = epoch_d = epoch_vae = 0.0
             n_batches = 0
 
-            # 训练阶段
+            # Alternate discriminator and VAE updates within each mini-batch.
             for batch in data_loader:
                 n_batches += 1
                 x = batch[0].to(self.device)
 
-                # Discriminator 更新
+                # Discriminator update.
                 with torch.no_grad():
                     mu, logvar = self.model.encoder(x)
                     z = self.model.reparameterize(mu, logvar)
@@ -1029,7 +1120,7 @@ class FactorVAETrainer:
                 loss_d.backward()
                 self.optim_d.step()
 
-                # VAE 更新
+                # VAE update with total-correlation penalty.
                 x_recon, mu, logvar, z = self.model(x)
                 recon_loss = ((x_recon - x) ** 2).view(x.size(0), -1).sum(dim=1).mean()
                 kl_loss = 0.5 * (logvar.exp() + mu**2 - 1 - logvar).sum(dim=1).mean()
@@ -1049,7 +1140,7 @@ class FactorVAETrainer:
                 loss_vae.backward()
                 self.optim_vae.step()
 
-            # 汇总
+            # Store epoch-level training diagnostics.
             self.history["recon"].append(epoch_recon / n_batches)
             self.history["kl"].append(epoch_kl / n_batches)
             self.history["tc"].append(epoch_tc / n_batches)
@@ -1071,13 +1162,19 @@ class FactorVAETrainer:
             plt.plot(self.history["tc"], label="TC")
             plt.plot(self.history["vae_total"], label="VAE Total")
             plt.plot(self.history["d"], label="Discriminator")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("FactorVAE Loss Curves")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("FactorVAE Loss Curves")
+            plt.legend()
+            plt.show()
 
             plt.figure(figsize=(6, 4))
             plt.plot(self.history["beta"], label="Beta")
-            plt.xlabel("Epoch"); plt.ylabel("Beta Value"); plt.title("Beta Warm-up Schedule")
-            plt.legend(); plt.show()
+            plt.xlabel("Epoch")
+            plt.ylabel("Beta Value")
+            plt.title("Beta Warm-up Schedule")
+            plt.legend()
+            plt.show()
 
     def plot_history(self):
         plt.figure(figsize=(8, 5))
@@ -1086,13 +1183,19 @@ class FactorVAETrainer:
         plt.plot(self.history["tc"], label="TC")
         plt.plot(self.history["vae_total"], label="VAE Total")
         plt.plot(self.history["d"], label="Discriminator")
-        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("FactorVAE Loss Curves")
-        plt.legend(); plt.show()
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("FactorVAE Loss Curves")
+        plt.legend()
+        plt.show()
 
         plt.figure(figsize=(6, 4))
         plt.plot(self.history["beta"], label="Beta")
-        plt.xlabel("Epoch"); plt.ylabel("Beta Value"); plt.title("Beta Warm-up Schedule")
-        plt.legend(); plt.show()
+        plt.xlabel("Epoch")
+        plt.ylabel("Beta Value")
+        plt.title("Beta Warm-up Schedule")
+        plt.legend()
+        plt.show()
 
     def evaluate_on_data(self, X):
         self.model.eval()
@@ -1111,12 +1214,7 @@ class FactorVAETrainer:
 
 
 class FactorVAE:
-    """
-    与其他模型一致的高阶封装：
-      - __init__(X_train, X_val, encoding_dim, layer1_neurons, layer2_neurons, layer3_neurons, n_clusters, lr_vae, lr_d, beta_max, warmup_epochs)
-      - train(num_epochs=..., show_plot=False)
-      - evaluate_on_data(X) -> (latent, rec_errors, evr, total_evr, recon_np)
-    """
+    """High-level wrapper for FactorVAE training and evaluation."""
     def __init__(
         self,
         X_train: np.ndarray,
@@ -1186,3 +1284,16 @@ class FactorVAE:
 
     def evaluate_on_data(self, X: np.ndarray):
         return self.trainer.evaluate_on_data(X)
+
+
+# Main workflow
+
+def main() -> None:
+    """Display available model wrappers when the module is executed as a script."""
+    available_models = ["AE", "SparseAE", "COAE", "VAE", "BetaVAE", "FactorVAE"]
+    print("Available model wrappers: " + ", ".join(available_models))
+    print(f"Runtime device: {device}")
+
+
+if __name__ == "__main__":
+    main()
